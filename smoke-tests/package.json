@@ -21,7 +21,7 @@
     "@npmcli/eslint-config": "^3.1.0",
     "@npmcli/promise-spawn": "^3.0.0",
     "@npmcli/template-oss": "4.3.2",
-    "minify-registry-metadata": "^2.2.0",
+    "minify-registry-metadata": "^3.0.0",
     "rimraf": "^3.0.2",
     "tap": "^16.0.1",
     "which": "^2.0.2"
