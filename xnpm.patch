@@ -1,0 +1,804 @@
+diff --git a/index.js b/index.js
+index 5447643..16e4b02 100644
+--- a/index.js
++++ b/index.js
+@@ -1,5 +1,25 @@
++#!/usr/bin/env node
+ if (require.main === module) {
++  // require('./lib/cli.js')(process)
++  const { isMainThread } = require('worker_threads');
++  if (!isMainThread) {
++    require('./lib/workers.js');
++    return;
++  }
+   require('./lib/cli.js')(process)
++  // const inspector = require('inspector');
++  // const session = new inspector.Session();
++  // session.connect();
++  // session.post('Profiler.enable', () => {
++  //   session.post('Profiler.start', async () => {
++  //     await require('./lib/cli.js')(process)
++  //     session.post('Profiler.stop', (err, { profile }) => {
++  //       if (!err) {
++  //         require('fs').writeFileSync('./xnpm.cpuprofile', JSON.stringify(profile));
++  //       }
++  //     });
++  //   });
++  // });
+ } else {
+   throw new Error('The programmatic API was removed in npm v8.0.0')
+ }
+diff --git a/lib/Perf.js b/lib/Perf.js
+new file mode 100644
+index 0000000..edffa68
+--- /dev/null
++++ b/lib/Perf.js
+@@ -0,0 +1,49 @@
++if (process.argv.indexOf('-xd') > 0) {
++    class Perf {
++        constructor() {
++            this.labels = {};
++            this.delayMark = 3000;
++            this.color = require('util').inspect.colors.gray[0];
++            this.write = process.stdout.write.bind(process.stdout);
++        }
++
++        mark(label) {
++            this.labels[label] = [Date.now()];
++        }
++
++        markLog(label, ...args) {
++            if (!this.labels[label]) {
++                throw new Error(`Perf: ${label} not marked`);
++            }
++            const t = Date.now();
++            const lt = this.labels[label];
++            const diff = t - lt[lt.length - 1];
++            lt.push(t);
++            this.write(`\x1b[${this.color}m${label}:\x1b[m \x1b[1m+${diff}ms\x1b[m`);
++            args.forEach((arg) => this.write(` \x1b[7m${arg}\x1b[m`));
++            this.write('\n');
++        }
++        
++        markEnd(label) {
++            if (!this.labels[label]) {
++                throw new Error(`Perf: ${label} not marked`);
++            }
++            const t = Date.now();
++            const diff = t - this.labels[label][0];
++            let ds = `${diff}ms`;
++            if (diff > this.delayMark) {
++                ds = `${diff/1000}s`;
++            }
++            delete this.labels[label];
++            this.write(`\x1b[${this.color}m${label}:\x1b[m \x1b[1m${ds}\x1b[m\n`);
++        }
++    }
++    global.Perf = new Perf();
++} else {
++    function dummy() {}
++    global.Perf = {
++        mark: dummy,
++        markLog: dummy,
++        markEnd: dummy,
++    };
++}
+diff --git a/lib/cli.js b/lib/cli.js
+index 7b87b94..ac57444 100644
+--- a/lib/cli.js
++++ b/lib/cli.js
+@@ -1,5 +1,7 @@
+ // Separated out for easier unit testing
+ module.exports = async process => {
++  require('./Perf.js');
++  Perf.mark('npm');
+   // set it here so that regardless of what happens later, we don't
+   // leak any private CLI configs to other programs
+   process.title = 'npm'
+@@ -35,6 +37,7 @@ module.exports = async process => {
+   process.on('uncaughtException', exitHandler)
+   process.on('unhandledRejection', exitHandler)
+ 
++  Perf.markLog('npm', '3+require()');
+   const Npm = require('./npm.js')
+   const npm = new Npm()
+   exitHandler.setNpm(npm)
+@@ -56,7 +59,9 @@ module.exports = async process => {
+   // now actually fire up npm and run the command.
+   // this is how to use npm programmatically:
+   try {
++    Perf.mark('npmload');
+     await npm.load()
++    Perf.markEnd('npmload');
+     if (npm.config.get('version', 'cli')) {
+       npm.output(npm.version)
+       return exitHandler()
+@@ -75,6 +80,7 @@ module.exports = async process => {
+       return exitHandler()
+     }
+ 
++    Perf.mark('npmexec');
+     await npm.exec(cmd, npm.argv)
+     return exitHandler()
+   } catch (err) {
+@@ -87,5 +93,8 @@ module.exports = async process => {
+       return exitHandler()
+     }
+     return exitHandler(err)
++  } finally {
++    Perf.markEnd('npmexec');
++    Perf.markEnd('npm');
+   }
+ }
+diff --git a/lib/commands/install.js b/lib/commands/install.js
+index ecc0727..084c59e 100644
+--- a/lib/commands/install.js
++++ b/lib/commands/install.js
+@@ -9,6 +9,7 @@ const Arborist = require('@npmcli/arborist')
+ const runScript = require('@npmcli/run-script')
+ const pacote = require('pacote')
+ const checks = require('npm-install-checks')
++const workers = require('../workers.js');
+ 
+ const ArboristWorkspaceCmd = require('../arborist-cmd.js')
+ class Install extends ArboristWorkspaceCmd {
+@@ -141,8 +142,11 @@ class Install extends ArboristWorkspaceCmd {
+       add: args,
+       workspaces: this.workspaceNames,
+     }
++    workers.implResolveNodesWorker(Arborist);
+     const arb = new Arborist(opts)
++    Perf.mark('npmexecreify');
+     await arb.reify(opts)
++    Perf.markEnd('npmexecreify');
+ 
+     if (!args.length && !isGlobalInstall && !ignoreScripts) {
+       const scripts = [
+@@ -166,7 +170,9 @@ class Install extends ArboristWorkspaceCmd {
+         })
+       }
+     }
++    Perf.mark('npmexecreifyFinish');
+     await reifyFinish(this.npm, arb)
++    Perf.markEnd('npmexecreifyFinish');
+   }
+ }
+ module.exports = Install
+diff --git a/lib/commands/run-script.js b/lib/commands/run-script.js
+index 8507dbe..fd41dca 100644
+--- a/lib/commands/run-script.js
++++ b/lib/commands/run-script.js
+@@ -122,13 +122,39 @@ class RunScript extends BaseCommand {
+       banner: !this.npm.silent,
+     }
+ 
+-    for (const [event, args] of events) {
+-      await runScript({
++    opts.banner = false;
++    /**
++     * Add unix-like environment variable command support on Windows
++     * 
++     * eg: `NODE_ENV=production node ...`
++     */
++    if (process.platform === 'win32' && pkg && pkg.scripts) {
++      // Only support one env variable
++      const REG_ENV = /^(\w+)=([^\s]+)\s+/;
++      const s = pkg.scripts[event];
++      const matches = s?.match(REG_ENV);
++      if (matches) {
++        const [env, key, value] = matches;
++        process.env[key] = value;
++        pkg.scripts[event] = s.substring(env.length);
++      }
++    }
++    Perf.mark('npmrun');
++    await events.reduce((a, [event, args]) => {
++      return a.then(() => runScript({
+         ...opts,
+         event,
+         args,
+-      })
+-    }
++      }))
++    }, Promise.resolve());
++    // for (const [event, args] of events) {
++    //   await runScript({
++    //     ...opts,
++    //     event,
++    //     args,
++    //   })
++    // }
++    Perf.markEnd('npmrun')
+   }
+ 
+   async list (args, path) {
+diff --git a/lib/npm.js b/lib/npm.js
+index b116ec5..b624e4f 100644
+--- a/lib/npm.js
++++ b/lib/npm.js
+@@ -15,7 +15,7 @@ const Timers = require('./utils/timers.js')
+ const Display = require('./utils/display.js')
+ const log = require('./utils/log-shim')
+ const replaceInfo = require('./utils/replace-info.js')
+-const updateNotifier = require('./utils/update-notifier.js')
++// const updateNotifier = require('./utils/update-notifier.js')
+ const pkg = require('../package.json')
+ const cmdList = require('./utils/cmd-list.js')
+ 
+@@ -87,18 +87,78 @@ class Npm extends EventEmitter {
+     await this.load()
+     const command = this.deref(cmd)
+     if (!command) {
++      /**
++       * Unknown command, try `run-scripts`
++       */
++      const Impl = require('./lifecycle-cmd.js');
++      const instance = new Impl(this);
++      const exec = (args) => this.exec('run-script', [cmd, ...args]);
++      instance.exec = exec;
++      instance.execWorkspaces = exec;
++      return instance;
+       throw Object.assign(new Error(`Unknown command ${cmd}`), {
+         code: 'EUNKNOWNCOMMAND',
+       })
+     }
+-    const Impl = require(`./commands/${command}.js`)
++    const ImplInstall = require('./commands/install.js');
++    const ImplRun = require('./commands/run-script.js');
++    let Impl = null;
++    switch (command) {
++      case 'install':
++        Impl = ImplInstall;
++        this.configureOptimizedRC();
++        break;
++      case 'run':
++        Impl = ImplRun;
++        this.configureOptimizedRC();
++        break;
++      default:
++        Impl = require(`./commands/${command}.js`);
++        break;
++    }
+     const impl = new Impl(this)
+     return impl
+   }
+ 
++  configureOptimizedRC() {
++    /**
++     * Audit will send report to registry, it waste time
++     * when install packages.
++     */
++    this.config.set('audit', false);
++    /**
++     * Know what happens is very important, there are some packages
++     * run pre-install scripts when being installed.
++     * 
++     * If it lags, we can see what going on in console, not just
++     * wait it finished.
++     */
++    this.config.set('foreground-scripts', true);
++    /**
++     * Default 5 minutes is too long, 10s is enough.
++     */
++    this.config.set('fetch-timeout', 10000);
++    /**
++     * The peerDependencies are unnecessary installed, users should
++     * be responsible for it.
++     */
++    this.config.set('omit', 'peer');
++    /**
++     * Remind users of using proxy, sometimes they maybe forgot had
++     * set a proxy and the install process frozen, without any
++     * infomation.
++     */
++    const proxy = this.config.get('proxy');
++    if (proxy) {
++      log.warn('Using a proxy ==>', proxy);
++    }
++  }
++
+   // Call an npm command
+   async exec (cmd, args) {
++    Perf.mark('npmexec_cmd');
+     const command = await this.cmd(cmd)
++    Perf.markLog('npmexec_cmd');
+     const timeEnd = this.time(`command:${cmd}`)
+ 
+     // since 'test', 'start', 'stop', etc. commands re-enter this function
+@@ -113,7 +173,6 @@ class Npm extends EventEmitter {
+     // finish before the command finishes running. it uses command and argv
+     // so it must be initiated here, after the command name is set
+     // eslint-disable-next-line promise/catch-or-return
+-    updateNotifier(this).then((msg) => (this.updateNotification = msg))
+ 
+     // Options are prefixed by a hyphen-minus (-, \u2d).
+     // Other dash-type chars look similar but are invalid.
+diff --git a/lib/workers.js b/lib/workers.js
+new file mode 100644
+index 0000000..5d9cb8e
+--- /dev/null
++++ b/lib/workers.js
+@@ -0,0 +1,130 @@
++/* eslint-disable */
++const events = require('events');
++const { Worker, isMainThread, parentPort } = require('worker_threads');
++
++class XnpmWorker extends events {
++    constructor() {
++        super();
++        this.workers = [];
++        this.workQueues = [];
++        this.maxWorkers = 2; // (os.cpus().length-1)/2
++    }
++
++    init() {
++        if (this.workers.length) {
++            return;
++        }
++
++        // Make sure there is at least one worker
++        this.create();
++    }
++
++    create() {
++        const worker = new Worker(__filename, {});
++        worker.working = false;
++        worker.on('exit', () => {
++            this.workers = this.workers.filter((wi) => wi !== worker);
++        });
++        this.workers.push(worker);
++        return worker;
++    }
++
++    runTask(taskInfo) {
++        return new Promise((resolve, reject) => {
++            let idle = this.workers.find((wi) => !wi.working);
++            if (!idle && this.workers.length < this.maxWorkers) {
++                idle = this.create();
++            }
++            const onMessage = ({ id, result }) => {
++                if (id !== taskInfo.id) {
++                    return;
++                }
++                resolve(result);
++                idle.working = false;
++                idle.off('message', onMessage);
++                this.queuedTask();
++            }
++            const work = () => {
++                idle.working = true;
++                idle.on('message', onMessage);
++                idle.once('error', reject);
++                idle.postMessage(taskInfo);
++            }
++            if (!idle) {
++                this.workQueues.push(work);
++                return;
++            }
++            work();
++        });
++    }
++
++    queuedTask() {
++        if (this.workQueues.length === 0) {
++            return;
++        }
++        const work = this.workQueues.shift();
++        work();
++    }
++}
++
++const loadVirtualResolve = 'arborist/load-virtual.js#resolveNodes+resolveLinks';
++
++if (isMainThread) {
++    function implResolveNodesWorker(cls) {
++        // Abstract function at "arborist/load-virtual.js"
++        cls.prototype.doInXnpmWorker = function (...argv) {
++            init();
++            const Node = require('@npmcli/arborist/lib/node.js');
++            const instance = this;
++            return async function (deps) {
++                const taskInfo = {
++                    id: loadVirtualResolve,
++                    context: fakeThis(instance, deps),
++                    argv,
++                };
++                const data = await worker.runTask(taskInfo);
++                data.nodes.forEach((node) => {
++                    node.__proto__ = Node.prototype;
++                });
++                return data;
++            }
++        }
++    }
++
++    function fakeThis(o, deps) {
++        const _this = {};
++        deps.forEach((key) => _this[key] = o[key]);
++        return _this;
++    }
++
++    let worker = null;
++    function init() {
++        if (!worker) {
++            worker = new XnpmWorker();
++        }
++        worker.init();
++    }
++    module.exports = {
++        implResolveNodesWorker,
++    };
++} else {
++    async function onMessage(e) {
++        let result = null;
++        switch (e.id) {
++            case loadVirtualResolve: {
++                const VirtualLoader = require('@npmcli/arborist/lib/arborist/load-virtual.js')(Object);
++                const vlr = Object.assign(
++                    new VirtualLoader({}),
++                    e.context,
++                );
++                result = vlr[Symbol.for('resolveNodes')](...e.argv);
++                // await vlr[Symbol.for('resolveLinks')](result.links, result.nodes);
++                break;
++            }
++            default:
++                break;
++        }
++        parentPort.postMessage({ id: e.id, result });
++    }
++    parentPort.on('message', onMessage);
++}
+diff --git a/package.json b/package.json
+index 8db35cf..f5e9e08 100644
+--- a/package.json
++++ b/package.json
+@@ -1,19 +1,15 @@
+ {
+   "version": "8.19.2",
+-  "name": "npm",
+-  "description": "a package manager for JavaScript",
++  "name": "xnpm",
++  "description": "a \"X\" version of npm, optimized as fast in development as possible",
+   "workspaces": [
+     "docs",
+     "smoke-tests",
+     "workspaces/*"
+   ],
+   "files": [
+-    "bin/",
+     "lib/",
+-    "index.js",
+-    "docs/content/**/*.md",
+-    "docs/output/**/*.html",
+-    "man"
++    "index.js"
+   ],
+   "keywords": [
+     "install",
+@@ -25,14 +21,14 @@
+   "config": {
+     "publishtest": false
+   },
+-  "homepage": "https://docs.npmjs.com/",
+-  "author": "GitHub Inc.",
++  "homepage": "https://github.com/LitileXueZha/xnpm#readme",
++  "author": "litilexuezha",
+   "repository": {
+     "type": "git",
+-    "url": "https://github.com/npm/cli.git"
++    "url": "https://github.com/litilexuezha/xnpm.git"
+   },
+   "bugs": {
+-    "url": "https://github.com/npm/cli/issues"
++    "url": "https://github.com/litilexuezha/xnpm/issues"
+   },
+   "directories": {
+     "bin": "./bin",
+@@ -42,8 +38,8 @@
+   },
+   "main": "./index.js",
+   "bin": {
+-    "npm": "bin/npm-cli.js",
+-    "npx": "bin/npx-cli.js"
++    "xnpm": "./index.js",
++    "xxnpm": "./dist/main.js"
+   },
+   "exports": {
+     ".": [
+@@ -95,7 +91,6 @@
+     "minipass-pipeline": "^1.2.4",
+     "mkdirp": "^1.0.4",
+     "mkdirp-infer-owner": "^2.0.0",
+-    "ms": "^2.1.2",
+     "node-gyp": "^9.1.0",
+     "nopt": "^6.0.0",
+     "npm-audit-report": "^3.0.0",
+@@ -208,15 +203,19 @@
+     "@npmcli/promise-spawn": "^3.0.0",
+     "@npmcli/template-oss": "4.3.2",
+     "@octokit/rest": "^19.0.4",
++    "esbuild": "^0.16.10",
+     "fs-minipass": "^2.1.0",
+     "licensee": "^8.2.0",
+     "minimatch": "^5.1.0",
+     "nock": "^13.2.4",
+     "spawk": "^1.7.1",
+-    "tap": "^16.0.1"
++    "tap": "^16.0.1",
++    "webpack": "^5.74.0",
++    "webpack-bundle-analyzer": "^4.6.1"
+   },
+   "scripts": {
+-    "dependencies": "node scripts/bundle-and-gitignore-deps.js && node scripts/dependency-graph.js",
++    "build": "node webpack.js",
++    "esbuild": "esbuild --bundle --platform=node --target=node18 --external:./node_modules/node-gyp/* --outfile=out.js index.js",
+     "dumpconf": "env | grep npm | sort | uniq",
+     "authors": "bash scripts/update-authors.sh",
+     "licenses": "licensee --production --errors-only",
+@@ -261,8 +260,8 @@
+     "version": "4.3.2",
+     "content": "./scripts/template-oss/root.js"
+   },
+-  "license": "Artistic-2.0",
++  "license": "MIT",
+   "engines": {
+-    "node": "^12.13.0 || ^14.15.0 || >=16.0.0"
++    "node": ">=18.0.0"
+   }
+ }
+diff --git a/webpack.js b/webpack.js
+new file mode 100644
+index 0000000..a0e6b70
+--- /dev/null
++++ b/webpack.js
+@@ -0,0 +1,61 @@
++/* eslint-disable */
++const path = require('path');
++const webpack = require('webpack');
++const TerserPlugin = require('terser-webpack-plugin');
++const { BundleAnalyzerPlugin } = require('webpack-bundle-analyzer');
++
++/** @type {webpack.Configuration} */
++const config = {
++    mode: 'production',
++    context: __dirname,
++    entry: './index.js',
++    output: {
++        path: path.join(__dirname, 'dist'),
++        filename: '[name].js',
++        assetModuleFilename: '[name][ext]',
++    },
++    target: 'node',
++    // devtool: 'source-map',
++    devtool: false,
++    module: {
++        noParse: /promise-inflight/,
++    },
++    plugins: [
++        new BundleAnalyzerPlugin({
++            analyzerMode: 'static',
++            openAnalyzer: false,
++        }),
++        new webpack.BannerPlugin({
++            banner: '#!/usr/bin/env node\n',
++            raw: true,
++            entryOnly: true,
++        }),
++        // new webpack.IgnorePlugin({ resourceRegExp: /node-gyp/ }),
++    ],
++    externalsType: 'commonjs',
++    externals: /^node-gyp/,
++    optimization: {
++        nodeEnv: false,
++        minimizer: [
++            // new TerserPlugin({
++            //     parallel: true,
++            // }),
++        ],
++        splitChunks: {
++            cacheGroups: {
++            },
++        },
++    },
++};
++
++const compiler = webpack(config);
++compiler.run((err, stats) => {
++    if (err) {
++        throw err;
++    }
++
++    process.stdout.write(stats.toString({
++        colors: true,
++    }));
++    compiler.close(() => {});
++});
+diff --git a/workspaces/arborist/lib/arborist/build-ideal-tree.js b/workspaces/arborist/lib/arborist/build-ideal-tree.js
+index e9a8720..d9d0562 100644
+--- a/workspaces/arborist/lib/arborist/build-ideal-tree.js
++++ b/workspaces/arborist/lib/arborist/build-ideal-tree.js
+@@ -205,16 +205,19 @@ module.exports = cls => class IdealTreeBuilder extends cls {
+     this.addTracker('idealTree')
+ 
+     try {
++      Perf.mark('npmexecreify_idealTree');
+       await this[_initTree]()
+       await this[_inflateAncientLockfile]()
+       await this[_applyUserRequests](options)
+       await this[_buildDeps]()
++      Perf.markLog('npmexecreify_idealTree', 'buildDeps()+fetch');
+       await this[_fixDepFlags]()
+       await this[_pruneFailedOptional]()
+       await this[_checkEngineAndPlatform]()
+     } finally {
+       process.emit('timeEnd', 'idealTree')
+       this.finishTracker('idealTree')
++      Perf.markEnd('npmexecreify_idealTree');
+     }
+ 
+     return treeCheck(this.idealTree)
+@@ -314,6 +317,7 @@ Try using the package name instead, e.g:
+         }).then(meta => Object.assign(root, { meta }))
+         : this.loadVirtual({ root }))
+ 
++      .then(s=>(Perf.markLog('npmexecreify_idealTree', 'loadVirtual()'),s))
+       // if we don't have a lockfile to go from, then start with the
+       // actual tree, so we only make the minimum required changes.
+       // don't do this for global installs or updates, because in those
+@@ -892,52 +896,25 @@ This is a one-time fix-up, please be patient...
+ 
+     const tasks = []
+     const peerSource = this[_peerSetSource].get(node) || node
++    const loadPromises = [];
++    const loadDeps = async (vrDep, edge, parent, required) => {
++      const dep = vrDep && vrDep.satisfies(edge) ? vrDep
++        : await this[_nodeFromEdge](edge, parent, null, required)
++      tasks.push({ edge, dep })
++    }
+     for (const edge of this[_problemEdges](node)) {
+       if (edge.peerConflicted) {
+         continue
+       }
+-
+-      // peerSetSource is only relevant when we have a peerEntryEdge
+-      // otherwise we're setting regular non-peer deps as if they have
+-      // a virtual root of whatever brought in THIS node.
+-      // so we VR the node itself if the edge is not a peer
+       const source = edge.peer ? peerSource : node
+-
+       const virtualRoot = this[_virtualRoot](source, true)
+-      // reuse virtual root if we already have one, but don't
+-      // try to do the override ahead of time, since we MAY be able
+-      // to create a more correct tree than the virtual root could.
+       const vrEdge = virtualRoot && virtualRoot.edgesOut.get(edge.name)
+       const vrDep = vrEdge && vrEdge.valid && vrEdge.to
+-      // only re-use the virtualRoot if it's a peer edge we're placing.
+-      // otherwise, we end up in situations where we override peer deps that
+-      // we could have otherwise found homes for.  Eg:
+-      // xy -> (x, y)
+-      // x -> PEER(z@1)
+-      // y -> PEER(z@2)
+-      // If xy is a dependency, we can resolve this like:
+-      // project
+-      // +-- xy
+-      // |   +-- y
+-      // |   +-- z@2
+-      // +-- x
+-      // +-- z@1
+-      // But if x and y are loaded in the same virtual root, then they will
+-      // be forced to agree on a version of z.
+       const required = new Set([edge.from])
+       const parent = edge.peer ? virtualRoot : null
+-      const dep = vrDep && vrDep.satisfies(edge) ? vrDep
+-        : await this[_nodeFromEdge](edge, parent, null, required)
+-
+-      /* istanbul ignore next */
+-      debug(() => {
+-        if (!dep) {
+-          throw new Error('no dep??')
+-        }
+-      })
+-
+-      tasks.push({ edge, dep })
++      loadPromises.push(loadDeps(vrDep, edge, parent, required));
+     }
++    await Promise.all(loadPromises);
+ 
+     const placeDeps = tasks
+       .sort((a, b) => localeCompare(a.edge.name, b.edge.name))
+@@ -1214,9 +1191,11 @@ This is a one-time fix-up, please be patient...
+       return this[_manifests].get(spec.raw)
+     } else {
+       log.silly('fetch manifest', spec.raw)
++      Perf.mark(`fetch(${spec.name})`);
+       const p = pacote.manifest(spec, options)
+         .then(mani => {
+           this[_manifests].set(spec.raw, mani)
++          Perf.markEnd(`fetch(${spec.name})`);
+           return mani
+         })
+       this[_manifests].set(spec.raw, p)
+diff --git a/workspaces/arborist/lib/arborist/load-virtual.js b/workspaces/arborist/lib/arborist/load-virtual.js
+index 947659f..2cbafee 100644
+--- a/workspaces/arborist/lib/arborist/load-virtual.js
++++ b/workspaces/arborist/lib/arborist/load-virtual.js
+@@ -99,7 +99,9 @@ module.exports = cls => class VirtualLoader extends cls {
+     this[checkRootEdges](s, root)
+     root.meta = s
+     this.virtualTree = root
++    Perf.mark('npmexecreify_loadVirtualNodes')
+     const { links, nodes } = this[resolveNodes](s, root)
++    Perf.markEnd('npmexecreify_loadVirtualNodes')
+     await this[resolveLinks](links, nodes)
+     if (!(s.originalLockfileVersion >= 2)) {
+       this[assignBundles](nodes)
+diff --git a/workspaces/arborist/lib/arborist/rebuild.js b/workspaces/arborist/lib/arborist/rebuild.js
+index 7e97984..3b28f57 100644
+--- a/workspaces/arborist/lib/arborist/rebuild.js
++++ b/workspaces/arborist/lib/arborist/rebuild.js
+@@ -168,6 +168,7 @@ module.exports = cls => class Builder extends cls {
+   }
+ 
+   async [_build] (nodes, { type = 'deps' }) {
++    Perf.mark('npmexecreify_reifyPackages_runScripts&&linkBins');
+     process.emit('time', `build:${type}`)
+ 
+     await this[_buildQueues](nodes)
+@@ -190,6 +191,7 @@ module.exports = cls => class Builder extends cls {
+     }
+ 
+     process.emit('timeEnd', `build:${type}`)
++    Perf.markEnd('npmexecreify_reifyPackages_runScripts&&linkBins');
+   }
+ 
+   async [_buildQueues] (nodes) {
+diff --git a/workspaces/arborist/lib/arborist/reify.js b/workspaces/arborist/lib/arborist/reify.js
+index 0c9026f..31eb028 100644
+--- a/workspaces/arborist/lib/arborist/reify.js
++++ b/workspaces/arborist/lib/arborist/reify.js
+@@ -152,11 +152,15 @@ module.exports = cls => class Reifier extends cls {
+     await this[_validatePath]()
+     await this[_loadTrees](options)
+     await this[_diffTrees]()
++    Perf.mark('npmexecreify_reifyPackages');
+     await this[_reifyPackages]()
++    Perf.markLog('npmexecreify_reifyPackages');
+     await this[_saveIdealTree](options)
+     await this[_copyIdealToActual]()
+     // This is a very bad pattern and I can't wait to stop doing it
++    Perf.mark('npmexecreify_auditReport');
+     this.auditReport = await this.auditReport
++    Perf.markLog('npmexecreify_auditReport');
+ 
+     this.finishTracker('reify')
+     process.emit('timeEnd', 'reify')
+@@ -952,6 +956,7 @@ module.exports = cls => class Reifier extends cls {
+   // kicking off each unpack job.  If any fail, we rimraf the sparse
+   // tree entirely and try to put everything back where it was.
+   [_unpackNewModules] () {
++    Perf.mark('npmexecreify_reifyPackages_unpackNewModules');
+     process.emit('time', 'reify:unpack')
+     const unpacks = []
+     dfwalk({
+@@ -987,6 +992,7 @@ module.exports = cls => class Reifier extends cls {
+     })
+     return promiseAllRejectLate(unpacks)
+       .then(() => process.emit('timeEnd', 'reify:unpack'))
++      .then(() => Perf.markEnd('npmexecreify_reifyPackages_unpackNewModules'))
+   }
+ 
+   // This is the part where we move back the unchanging nodes that were
+diff --git a/workspaces/arborist/lib/debug.js b/workspaces/arborist/lib/debug.js
+index aeda722..6da238f 100644
+--- a/workspaces/arborist/lib/debug.js
++++ b/workspaces/arborist/lib/debug.js
+@@ -21,7 +21,7 @@ const debug = process.env.ARBORIST_DEBUG !== '0' && (
+   process.cwd() === require('path').resolve(__dirname, '..')
+ )
+ 
+-module.exports = debug ? fn => fn() : () => {}
++module.exports = () => {}
+ const red = process.stderr.isTTY ? msg => `\x1B[31m${msg}\x1B[39m` : m => m
+ module.exports.log = (...msg) => module.exports(() => {
+   const { format } = require('util')
